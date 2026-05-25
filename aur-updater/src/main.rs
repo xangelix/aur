@@ -39,10 +39,13 @@ fn main() {
         std::process::exit(1);
     }
 
+    let mut monorepo_updated = false;
+
     // Is this a single package directory?
     if base_path.join("PKGBUILD").exists() {
-        if let Err(e) = process_package(&base_path, &args) {
-            eprintln!(" -> Error processing [{}]: {}", base_path.display(), e);
+        match process_package(&base_path, &args) {
+            Ok(updated) => monorepo_updated = updated,
+            Err(e) => eprintln!(" -> Error processing [{}]: {e}", base_path.display()),
         }
     } else {
         // Otherwise, treat it as the monorepo root and scan subdirectories
@@ -50,20 +53,37 @@ fn main() {
             Ok(entries) => {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_dir()
-                        && path.join("PKGBUILD").exists()
-                        && let Err(e) = process_package(&path, &args)
-                    {
-                        eprintln!(" -> Error processing [{}]: {}", path.display(), e);
+                    if path.is_dir() && path.join("PKGBUILD").exists() {
+                        match process_package(&path, &args) {
+                            Ok(updated) => {
+                                if updated {
+                                    monorepo_updated = true;
+                                }
+                            }
+                            Err(e) => eprintln!(" -> Error processing [{}]: {e}", path.display()),
+                        }
                     }
                 }
             }
             Err(e) => eprintln!("Failed to read base directory: {e}"),
         }
     }
+
+    // If any submodule pointers were committed, push the parent monorepo to GitHub
+    if monorepo_updated && args.push {
+        println!(" -> Pushing parent monorepo changes up to GitHub...");
+        let push_status = Command::new("git")
+            .args(["push", "origin", "HEAD"])
+            .status();
+
+        match push_status {
+            Ok(s) if s.success() => println!(" -> Parent monorepo pushed successfully!"),
+            _ => eprintln!(" -> Warning: Parent monorepo git push failed."),
+        }
+    }
 }
 
-fn process_package(dir: &Path, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
     let folder_name = dir.file_name().unwrap().to_string_lossy().to_string();
     let pkgbuild_path = dir.join("PKGBUILD");
     let mut content = fs::read_to_string(&pkgbuild_path)?;
@@ -72,6 +92,7 @@ fn process_package(dir: &Path, args: &Args) -> Result<(), Box<dyn std::error::Er
     let upstream_url = extract_variable(&content, "url").unwrap_or_default();
 
     let mut updated = false;
+    let mut parent_repo_changed = false;
 
     println!("Checking [{folder_name}]...");
 
@@ -168,7 +189,7 @@ fn process_package(dir: &Path, args: &Args) -> Result<(), Box<dyn std::error::Er
             println!("Successfully updated [{folder_name}] to v{final_version}!");
 
             if args.commit {
-                println!(" -> Staging and committing changes...");
+                println!(" -> Staging and committing changes inside submodule...");
                 Command::new("git")
                     .args(["add", "PKGBUILD", ".SRCINFO"])
                     .current_dir(dir)
@@ -185,7 +206,7 @@ fn process_package(dir: &Path, args: &Args) -> Result<(), Box<dyn std::error::Er
                 }
 
                 if commit_cmd.status()?.success() {
-                    println!(" -> Commit generated successfully.");
+                    println!(" -> Submodule commit generated successfully.");
 
                     // Optional: Push to AUR Remote upstream
                     if args.push {
@@ -196,9 +217,28 @@ fn process_package(dir: &Path, args: &Args) -> Result<(), Box<dyn std::error::Er
                             .status()?;
 
                         if push_status.success() {
-                            println!(" -> Successfully pushed upstream.");
+                            println!(" -> Successfully pushed upstream to AUR.");
                         } else {
                             eprintln!(" -> Warning: Git push failed.");
+                        }
+                    }
+
+                    // Automatically update the tracking pointer in the parent repository
+                    println!(" -> Syncing submodule pointer reference in parent repository...");
+                    let parent_add = Command::new("git").args(["add", &folder_name]).status()?;
+
+                    if parent_add.success() {
+                        let parent_msg = format!("chore({folder_name}): bump to v{final_version}");
+                        let mut parent_commit = Command::new("git");
+                        parent_commit.args(["commit", "-m", &parent_msg]);
+
+                        if !args.no_sign {
+                            parent_commit.arg("-S");
+                        }
+
+                        if parent_commit.status()?.success() {
+                            println!(" -> Parent repository pointer tracked successfully.");
+                            parent_repo_changed = true;
                         }
                     }
                 }
@@ -206,7 +246,7 @@ fn process_package(dir: &Path, args: &Args) -> Result<(), Box<dyn std::error::Er
         }
     }
 
-    Ok(())
+    Ok(parent_repo_changed)
 }
 
 fn extract_variable(content: &str, var_name: &str) -> Option<String> {
