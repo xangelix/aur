@@ -71,24 +71,12 @@ fn process_package(dir: &Path, args: &Args) -> Result<(), Box<dyn std::error::Er
     let current_version = extract_variable(&content, "pkgver").unwrap_or_default();
     let upstream_url = extract_variable(&content, "url").unwrap_or_default();
 
-    let bump_script = dir.join("bump_version.sh");
     let mut updated = false;
 
     println!("Checking [{folder_name}]...");
 
-    // 1. Check for custom override script
-    if bump_script.exists() {
-        println!(" -> Found custom bump_version.sh. Running...");
-        let status = Command::new("sh")
-            .arg("bump_version.sh")
-            .current_dir(dir)
-            .status()?;
-        if status.success() {
-            updated = true;
-        }
-    }
-    // 2. Handle VCS/Git packages
-    else if folder_name.ends_with("-git") || content.contains("pkgver()") {
+    // 1. Handle VCS/Git packages
+    if folder_name.ends_with("-git") || content.contains("pkgver()") {
         println!(" -> VCS package detected. Running updpkgver...");
         let status = Command::new("updpkgver").current_dir(dir).status();
         let run_success = match status {
@@ -115,7 +103,7 @@ fn process_package(dir: &Path, args: &Args) -> Result<(), Box<dyn std::error::Er
             }
         }
     }
-    // 3. Handle Fixed-version Packages mapped to GitHub
+    // 2. Handle Fixed-version Packages mapped to GitHub
     else if upstream_url.contains("github.com")
         && let Some(latest_version) = get_latest_github_version(&upstream_url)?
     {
