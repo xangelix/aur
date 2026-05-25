@@ -1,0 +1,287 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use clap::Parser;
+use regex::Regex;
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Parser, Debug)]
+#[command(author, version, about = "Robust AUR Monorepo Updater")]
+struct Args {
+    /// Automatically commit changes if updates are found
+    #[arg(short, long)]
+    commit: bool,
+
+    /// Automatically git push to origin after a successful commit
+    #[arg(short, long)]
+    push: bool,
+
+    /// Test-build the package with makepkg before committing
+    #[arg(short, long)]
+    build: bool,
+
+    /// Do not sign the git commit (omits -S flag)
+    #[arg(short, long)]
+    no_sign: bool,
+
+    /// Base directory or specific package folder
+    #[arg(short, long, default_value = ".")]
+    dir: String,
+}
+
+fn main() {
+    let args = Args::parse();
+    let base_path = PathBuf::from(&args.dir);
+
+    if !base_path.exists() {
+        eprintln!("Error: Target directory '{}' does not exist.", args.dir);
+        std::process::exit(1);
+    }
+
+    // Is this a single package directory?
+    if base_path.join("PKGBUILD").exists() {
+        if let Err(e) = process_package(&base_path, &args) {
+            eprintln!(" -> Error processing [{}]: {}", base_path.display(), e);
+        }
+    } else {
+        // Otherwise, treat it as the monorepo root and scan subdirectories
+        match fs::read_dir(&base_path) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir()
+                        && path.join("PKGBUILD").exists()
+                        && let Err(e) = process_package(&path, &args)
+                    {
+                        eprintln!(" -> Error processing [{}]: {}", path.display(), e);
+                    }
+                }
+            }
+            Err(e) => eprintln!("Failed to read base directory: {e}"),
+        }
+    }
+}
+
+fn process_package(dir: &Path, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let folder_name = dir.file_name().unwrap().to_string_lossy().to_string();
+    let pkgbuild_path = dir.join("PKGBUILD");
+    let mut content = fs::read_to_string(&pkgbuild_path)?;
+
+    let current_version = extract_variable(&content, "pkgver").unwrap_or_default();
+    let upstream_url = extract_variable(&content, "url").unwrap_or_default();
+
+    let bump_script = dir.join("bump_version.sh");
+    let mut updated = false;
+
+    println!("Checking [{folder_name}]...");
+
+    // 1. Check for custom override script
+    if bump_script.exists() {
+        println!(" -> Found custom bump_version.sh. Running...");
+        let status = Command::new("sh")
+            .arg("bump_version.sh")
+            .current_dir(dir)
+            .status()?;
+        if status.success() {
+            updated = true;
+        }
+    }
+    // 2. Handle VCS/Git packages
+    else if folder_name.ends_with("-git") || content.contains("pkgver()") {
+        println!(" -> VCS package detected. Running updpkgver...");
+        let status = Command::new("updpkgver").current_dir(dir).status();
+        let run_success = match status {
+            Ok(s) => s.success(),
+            _ => {
+                // Fallback to running a source fetch if updpkgver isn't in PATH
+                Command::new("makepkg")
+                    .args(["-od", "--noprepare"])
+                    .current_dir(dir)
+                    .status()?
+                    .success()
+            }
+        };
+
+        if run_success {
+            let git_diff = Command::new("git")
+                .args(["diff", "--name-only", "PKGBUILD"])
+                .current_dir(dir)
+                .output()?;
+            if git_diff.stdout.is_empty() {
+                println!(" -> Up to date (VCS HEAD unchanged)");
+            } else {
+                updated = true;
+            }
+        }
+    }
+    // 3. Handle Fixed-version Packages mapped to GitHub
+    else if upstream_url.contains("github.com")
+        && let Some(latest_version) = get_latest_github_version(&upstream_url)?
+    {
+        if latest_version == current_version {
+            println!(" -> Up to date ({current_version})");
+        } else {
+            println!(" -> New version available: {current_version} -> {latest_version}");
+
+            content = update_pkgbuild_version(&content, &latest_version);
+
+            // Write version to disk first so updpkgsums checks the correct target
+            fs::write(&pkgbuild_path, content)?;
+
+            println!(" -> Regenerating integrity checksums via updpkgsums...");
+            let checksum_status = Command::new("updpkgsums").current_dir(dir).status()?;
+            if !checksum_status.success() {
+                return Err(format!("updpkgsums failed for package '{folder_name}'").into());
+            }
+            updated = true;
+        }
+    }
+
+    // Regenerate .SRCINFO if updates occurred
+    if updated {
+        // Regenerate .SRCINFO
+        let srcinfo_output = Command::new("makepkg")
+            .arg("--printsrcinfo")
+            .current_dir(dir)
+            .output()?;
+        if srcinfo_output.status.success() {
+            fs::write(dir.join(".SRCINFO"), srcinfo_output.stdout)?;
+        }
+
+        // Git change detection & operational lifecycle stage
+        // Optional: Pre-flight Build Test
+        if args.build {
+            println!(" -> [--build] Initiating test build via makepkg...");
+            // -s installs missing dependencies, --noconfirm handles prompts, -c cleans up work directories after build
+            let build_status = Command::new("makepkg")
+                .args(["-s", "--noconfirm", "--needed", "-c"])
+                .current_dir(dir)
+                .status()?;
+
+            if !build_status.success() {
+                return Err(format!(
+                    "Test build failed for package '{folder_name}'. Aborting Git sequence."
+                )
+                .into());
+            }
+            println!(" -> Test build completed successfully!");
+        }
+
+        // Git Verification & Lifecycle Action Block
+        let git_status = Command::new("git")
+            .args(["status", "--porcelain", "."])
+            .current_dir(dir)
+            .output()?;
+        if !git_status.stdout.is_empty() {
+            let fresh_content = fs::read_to_string(&pkgbuild_path)?;
+            let final_version =
+                extract_variable(&fresh_content, "pkgver").unwrap_or(current_version);
+            println!("Successfully updated [{folder_name}] to v{final_version}!");
+
+            if args.commit {
+                println!(" -> Staging and committing changes...");
+                Command::new("git")
+                    .args(["add", "PKGBUILD", ".SRCINFO"])
+                    .current_dir(dir)
+                    .status()?;
+
+                let commit_msg = format!("chore({folder_name}): bump to v{final_version}");
+                let mut commit_cmd = Command::new("git");
+                commit_cmd
+                    .args(["commit", "-m", &commit_msg])
+                    .current_dir(dir);
+
+                if !args.no_sign {
+                    commit_cmd.arg("-S");
+                }
+
+                if commit_cmd.status()?.success() {
+                    println!(" -> Commit generated successfully.");
+
+                    // Optional: Push to AUR Remote upstream
+                    if args.push {
+                        println!(" -> [--push] Pushing changes upstream to the AUR remote...");
+                        let push_status = Command::new("git")
+                            .args(["push", "origin", "HEAD"])
+                            .current_dir(dir)
+                            .status()?;
+
+                        if push_status.success() {
+                            println!(" -> Successfully pushed upstream.");
+                        } else {
+                            eprintln!(" -> Warning: Git push failed.");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn extract_variable(content: &str, var_name: &str) -> Option<String> {
+    let re = Regex::new(&format!(
+        r#"(?m)^\s*{var_name}\s*=\s*(?:"([^"]+)"|([^\s]+))"#
+    ))
+    .unwrap();
+    if let Some(caps) = re.captures(content) {
+        return caps
+            .get(1)
+            .or_else(|| caps.get(2))
+            .map(|m| m.as_str().to_string());
+    }
+    None
+}
+
+fn update_pkgbuild_version(content: &str, new_version: &str) -> String {
+    let re_ver = Regex::new(r"(?m)^\s*pkgver=.*$").unwrap();
+    let re_rel = Regex::new(r"(?m)^\s*pkgrel=.*$").unwrap();
+
+    let updated = re_ver
+        .replace(content, &format!(r#"pkgver="{new_version}""#))
+        .into_owned();
+    re_rel.replace(&updated, "pkgrel=1").into_owned()
+}
+
+fn get_latest_github_version(url: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let re = Regex::new(r"github\.com/([^/]+)/([^/]+)").unwrap();
+    if let Some(caps) = re.captures(url) {
+        let owner = caps.get(1).unwrap().as_str();
+        let repo = caps
+            .get(2)
+            .unwrap()
+            .as_str()
+            .trim_end_matches(".git")
+            .trim_end_matches('/');
+
+        let api_url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("aur-monorepo-updater")
+            .build()?;
+
+        let res = client.get(&api_url).send()?;
+        if res.status().is_success() {
+            let json: serde_json::Value = res.json()?;
+            if let Some(tag) = json.get("tag_name").and_then(|v| v.as_str()) {
+                return Ok(Some(tag.trim_start_matches('v').to_string()));
+            }
+        } else {
+            // Fallback for repos that use Git tags but don't explicitly create GitHub Release entries
+            let tags_url = format!("https://api.github.com/repos/{owner}/{repo}/tags");
+            let res_tags = client.get(&tags_url).send()?;
+            if res_tags.status().is_success() {
+                let json: serde_json::Value = res_tags.json()?;
+                if let Some(first_tag) = json
+                    .get(0)
+                    .and_then(|t| t.get("name"))
+                    .and_then(|v| v.as_str())
+                {
+                    return Ok(Some(first_tag.trim_start_matches('v').to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
