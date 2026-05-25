@@ -1,0 +1,39 @@
+[submodule "edirstat"]
+	path = edirstat
+	url = ssh://aur@aur.archlinux.org/edirstat.git
+[submodule "geesefs-bin"]
+	path = geesefs-bin
+	url = ssh://aur@aur.archlinux.org/geesefs-bin.git
+[submodule "cargo-shear"]
+	path = cargo-shear
+	url = ssh://aur@aur.archlinux.org/cargo-shear.git
+[submodule "ytdl-sub-bin"]
+	path = ytdl-sub-bin
+	url = ssh://aur@aur.archlinux.org/ytdl-sub-bin.git
+[submodule "ytdl-sub"]
+	path = ytdl-sub
+	url = ssh://aur@aur.archlinux.org/ytdl-sub.git
+[submodule "element-desktop-git"]
+	path = element-desktop-git
+	url = ssh://aur@aur.archlinux.org/element-desktop-git.git
+[submodule "kasmvncserver-bin"]
+	path = kasmvncserver-bin
+	url = ssh://aur@aur.archlinux.org/kasmvncserver-bin.git
+[submodule "nodejs-cross-env"]
+	path = nodejs-cross-env
+	url = ssh://aur@aur.archlinux.org/nodejs-cross-env.git
+[submodule "python-lion-pytorch"]
+	path = python-lion-pytorch
+	url = ssh://aur@aur.archlinux.org/python-lion-pytorch.git
+[submodule "steam-rom-manager-appimage"]
+	path = steam-rom-manager-appimage
+	url = ssh://aur@aur.archlinux.org/steam-rom-manager-appimage.git
+[submodule "geesefs-git"]
+	path = geesefs-git
+	url = ssh://aur@aur.archlinux.org/geesefs-git.git
+[submodule "steam-rom-manager-git"]
+	path = steam-rom-manager-git
+	url = ssh://aur@aur.archlinux.org/steam-rom-manager-git.git
+[submodule "python-bitsandbytes-rocm-git"]
+	path = python-bitsandbytes-rocm-git
+	url = ssh://aur@aur.archlinux.org/python-bitsandbytes-rocm-git.git
