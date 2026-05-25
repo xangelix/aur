@@ -162,9 +162,9 @@ fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::
         // Optional: Pre-flight Build Test
         if args.build {
             println!(" -> [--build] Initiating test build via makepkg...");
-            // -s installs missing dependencies, --noconfirm handles prompts, -c cleans up work directories after build
+            // -s installs missing dependencies, --noconfirm handles prompts, -c cleans up work directories after build, -f forces overwrite
             let build_status = Command::new("makepkg")
-                .args(["-s", "--noconfirm", "--needed", "-c"])
+                .args(["-s", "--noconfirm", "--needed", "-c", "-f"])
                 .current_dir(dir)
                 .status()?;
 
