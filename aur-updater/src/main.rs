@@ -163,11 +163,25 @@ fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::
         // Optional: Pre-flight Build Test
         if args.build {
             println!(" -> [--build] Initiating test build via makepkg...");
-            // -s installs missing dependencies, --noconfirm handles prompts, -c cleans up work directories after build, -f forces overwrite
-            let build_status = Command::new("makepkg")
-                .args(["-s", "--noconfirm", "--needed", "-c", "-f"])
-                .current_dir(dir)
-                .status()?;
+
+            // Added "-C" to force makepkg to wipe out any old src/ directory before building
+            let mut build_cmd = Command::new("makepkg");
+            build_cmd
+                .args(["-s", "--noconfirm", "--needed", "-c", "-f", "-C"])
+                .current_dir(dir);
+
+            // Dynamically strip out ALL ambient Cargo and Rust configurations
+            for (key, _) in std::env::vars() {
+                if key.starts_with("CARGO") || key.starts_with("RUST") {
+                    build_cmd.env_remove(&key);
+                }
+            }
+
+            // Clean up the dynamic linker paths leaked by `cargo run`
+            build_cmd.env_remove("LD_LIBRARY_PATH");
+            build_cmd.env_remove("DYLD_LIBRARY_PATH");
+
+            let build_status = build_cmd.status()?;
 
             if !build_status.success() {
                 return Err(format!(
