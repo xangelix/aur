@@ -74,6 +74,7 @@ fn main() {
         println!(" -> Pushing parent monorepo changes up to GitHub...");
         let push_status = Command::new("git")
             .args(["push", "origin", "HEAD"])
+            .current_dir(&base_path)
             .status();
 
         match push_status {
@@ -225,12 +226,21 @@ fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::
 
                     // Automatically update the tracking pointer in the parent repository
                     println!(" -> Syncing submodule pointer reference in parent repository...");
-                    let parent_add = Command::new("git").args(["add", &folder_name]).status()?;
+
+                    // Safely resolve the parent directory (the monorepo root)
+                    let parent_dir = dir.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+                    let parent_add = Command::new("git")
+                        .args(["add", &folder_name])
+                        .current_dir(parent_dir)
+                        .status()?;
 
                     if parent_add.success() {
                         let parent_msg = format!("chore({folder_name}): bump to v{final_version}");
                         let mut parent_commit = Command::new("git");
-                        parent_commit.args(["commit", "-m", &parent_msg]);
+                        parent_commit
+                            .args(["commit", "-m", &parent_msg])
+                            .current_dir(parent_dir);
 
                         if !args.no_sign {
                             parent_commit.arg("-S");
