@@ -28,6 +28,10 @@ struct Args {
     /// Base directory or specific package folder
     #[arg(short, long, default_value = ".")]
     dir: String,
+
+    /// Custom commit message suffix (appended after 'chore(pkgname): ')
+    #[arg(short, long)]
+    message: Option<String>,
 }
 
 fn main() {
@@ -74,7 +78,6 @@ fn main() {
         println!(" -> Pushing parent monorepo changes up to GitHub...");
         let push_status = Command::new("git")
             .args(["push", "origin", "HEAD"])
-            .current_dir(&base_path)
             .status();
 
         match push_status {
@@ -87,7 +90,7 @@ fn main() {
 fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::Error>> {
     let folder_name = dir.file_name().unwrap().to_string_lossy().to_string();
     let pkgbuild_path = dir.join("PKGBUILD");
-    let mut content = fs::read_to_string(&pkgbuild_path)?;
+    let content = fs::read_to_string(&pkgbuild_path)?;
 
     let current_version = extract_variable(&content, "pkgver").unwrap_or_default();
     let upstream_url = extract_variable(&content, "url").unwrap_or_default();
@@ -97,20 +100,32 @@ fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::
 
     println!("Checking [{folder_name}]...");
 
-    // 1. Handle VCS/Git packages
-    if folder_name.ends_with("-git") || content.contains("pkgver()") {
+    // Check for pre-existing uncommitted manual modifications to the PKGBUILD
+    let local_git_status = Command::new("git")
+        .args(["status", "--porcelain", "PKGBUILD"])
+        .current_dir(dir)
+        .output()?;
+
+    let has_local_changes = !local_git_status.stdout.is_empty();
+
+    // 1. Route: Handle Pre-modified local configurations (Description/Pkgrel bumps)
+    if has_local_changes {
+        println!(
+            " -> Local modifications detected in PKGBUILD. Bypassing upstream version checks."
+        );
+        updated = true;
+    }
+    // 2. Route: Handle VCS/Git packages
+    else if folder_name.ends_with("-git") || content.contains("pkgver()") {
         println!(" -> VCS package detected. Running updpkgver...");
         let status = Command::new("updpkgver").current_dir(dir).status();
         let run_success = match status {
             Ok(s) => s.success(),
-            _ => {
-                // Fallback to running a source fetch if updpkgver isn't in PATH
-                Command::new("makepkg")
-                    .args(["-od", "--noprepare"])
-                    .current_dir(dir)
-                    .status()?
-                    .success()
-            }
+            _ => Command::new("makepkg")
+                .args(["-od", "--noprepare"])
+                .current_dir(dir)
+                .status()?
+                .success(),
         };
 
         if run_success {
@@ -125,7 +140,7 @@ fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::
             }
         }
     }
-    // 2. Handle Fixed-version Packages mapped to GitHub
+    // 3. Route: Handle Standard automated GitHub upgrades
     else if upstream_url.contains("github.com")
         && let Some(latest_version) = get_latest_github_version(&upstream_url)?
     {
@@ -134,10 +149,8 @@ fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::
         } else {
             println!(" -> New version available: {current_version} -> {latest_version}");
 
-            content = update_pkgbuild_version(&content, &latest_version);
-
-            // Write version to disk first so updpkgsums checks the correct target
-            fs::write(&pkgbuild_path, content)?;
+            let updated_content = update_pkgbuild_version(&content, &latest_version);
+            fs::write(&pkgbuild_path, updated_content)?;
 
             println!(" -> Regenerating integrity checksums via updpkgsums...");
             let checksum_status = Command::new("updpkgsums").current_dir(dir).status()?;
@@ -148,9 +161,10 @@ fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::
         }
     }
 
-    // Regenerate .SRCINFO if updates occurred
+    // Process Lifecycle execution block if updates/modifications are present
     if updated {
-        // Regenerate .SRCINFO
+        // Regenerate .SRCINFO to match current state of the PKGBUILD
+        println!(" -> Syncing and regenerating .SRCINFO...");
         let srcinfo_output = Command::new("makepkg")
             .arg("--printsrcinfo")
             .current_dir(dir)
@@ -159,30 +173,23 @@ fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::
             fs::write(dir.join(".SRCINFO"), srcinfo_output.stdout)?;
         }
 
-        // Git change detection & operational lifecycle stage
-        // Optional: Pre-flight Build Test
+        // Optional: Pre-flight Build Test with aggressively isolated environment
         if args.build {
-            println!(" -> [--build] Initiating test build via makepkg...");
-
-            // Added "-C" to force makepkg to wipe out any old src/ directory before building
+            println!(" -> [--build] Initiating sandbox test build via makepkg...");
             let mut build_cmd = Command::new("makepkg");
             build_cmd
                 .args(["-s", "--noconfirm", "--needed", "-c", "-f", "-C"])
                 .current_dir(dir);
 
-            // Dynamically strip out ALL ambient Cargo and Rust configurations
             for (key, _) in std::env::vars() {
                 if key.starts_with("CARGO") || key.starts_with("RUST") {
                     build_cmd.env_remove(&key);
                 }
             }
-
-            // Clean up the dynamic linker paths leaked by `cargo run`
             build_cmd.env_remove("LD_LIBRARY_PATH");
             build_cmd.env_remove("DYLD_LIBRARY_PATH");
 
             let build_status = build_cmd.status()?;
-
             if !build_status.success() {
                 return Err(format!(
                     "Test build failed for package '{folder_name}'. Aborting Git sequence."
@@ -197,11 +204,12 @@ fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::
             .args(["status", "--porcelain", "."])
             .current_dir(dir)
             .output()?;
+
         if !git_status.stdout.is_empty() {
             let fresh_content = fs::read_to_string(&pkgbuild_path)?;
             let final_version =
                 extract_variable(&fresh_content, "pkgver").unwrap_or(current_version);
-            println!("Successfully updated [{folder_name}] to v{final_version}!");
+            println!("Ready to commit changes for [{folder_name}] at v{final_version}!");
 
             if args.commit {
                 println!(" -> Staging and committing changes inside submodule...");
@@ -210,7 +218,12 @@ fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::
                     .current_dir(dir)
                     .status()?;
 
-                let commit_msg = format!("chore({folder_name}): bump to v{final_version}");
+                // Resolve commit message (custom vs automated fallback)
+                let commit_msg = args.message.as_ref().map_or_else(
+                    || format!("chore({folder_name}): bump to v{final_version}"),
+                    |custom| format!("chore({folder_name}): {custom}"),
+                );
+
                 let mut commit_cmd = Command::new("git");
                 commit_cmd
                     .args(["commit", "-m", &commit_msg])
@@ -223,7 +236,6 @@ fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::
                 if commit_cmd.status()?.success() {
                     println!(" -> Submodule commit generated successfully.");
 
-                    // Optional: Push to AUR Remote upstream
                     if args.push {
                         println!(" -> [--push] Pushing changes upstream to the AUR remote...");
                         let push_status = Command::new("git")
@@ -238,23 +250,20 @@ fn process_package(dir: &Path, args: &Args) -> Result<bool, Box<dyn std::error::
                         }
                     }
 
-                    // Automatically update the tracking pointer in the parent repository
                     println!(" -> Syncing submodule pointer reference in parent repository...");
 
-                    // Safely resolve the parent directory (the monorepo root)
-                    let parent_dir = dir.parent().unwrap_or_else(|| std::path::Path::new("."));
-
+                    // 1. Point this command to the monorepo root folder
                     let parent_add = Command::new("git")
                         .args(["add", &folder_name])
-                        .current_dir(parent_dir)
+                        .current_dir(dir.parent().unwrap_or_else(|| Path::new(".")))
                         .status()?;
 
                     if parent_add.success() {
-                        let parent_msg = format!("chore({folder_name}): bump to v{final_version}");
                         let mut parent_commit = Command::new("git");
-                        parent_commit
-                            .args(["commit", "-m", &parent_msg])
-                            .current_dir(parent_dir);
+                        parent_commit.args(["commit", "-m", &commit_msg]);
+
+                        // 2. Point the commit command to the monorepo root folder too
+                        parent_commit.current_dir(dir.parent().unwrap_or_else(|| Path::new(".")));
 
                         if !args.no_sign {
                             parent_commit.arg("-S");
