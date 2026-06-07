@@ -37,3 +37,6 @@
 [submodule "python-bitsandbytes-rocm-git"]
 	path = python-bitsandbytes-rocm-git
 	url = ssh://aur@aur.archlinux.org/python-bitsandbytes-rocm-git.git
+[submodule "edirstat-git"]
+	path = edirstat-git
+	url = ssh://aur@aur.archlinux.org/edirstat-git.git
