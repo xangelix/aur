@@ -46,3 +46,6 @@
 [submodule "fencecat-git"]
 	path = fencecat-git
 	url = ssh://aur@aur.archlinux.org/fencecat-git.git
+[submodule "edirstat-bin"]
+	path = edirstat-bin
+	url = ssh://aur@aur.archlinux.org/edirstat-bin.git
